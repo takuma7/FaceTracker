@@ -39,7 +39,26 @@
 ///////////////////////////////////////////////////////////////////////////////
 #include <FaceTracker/Tracker.h>
 #include <opencv/highgui.h>
+#include <opencv2/photo/photo.hpp>
+#include <opencv2/imgproc/imgproc.hpp>
 #include <iostream>
+#include <omp.h>
+
+#define N 2 // number of cameras
+
+//=============================================================================
+int dst_index(int i){
+    i++;
+    if(i>N-1) i=0;
+    return i;
+}
+
+int src_index(int i){
+    i--;
+    if(i<0) i=N-1;
+    return i;
+}
+
 //=============================================================================
 void Draw(cv::Mat &image,cv::Mat &shape,cv::Mat &con,cv::Mat &tri,cv::Mat &visi)
 {
@@ -85,6 +104,66 @@ void Draw(cv::Mat &image,cv::Mat &shape,cv::Mat &con,cv::Mat &tri,cv::Mat &visi)
         c = CV_RGB(255,0,0); cv::circle(image,p1,2,c);
     }return;
 }
+void ExtractMask(cv::Mat &face_im, cv::Mat &mask, cv::Mat &frame, cv::Mat &shape,cv::Mat &con,cv::Mat &tri,cv::Mat &visi, cv::Mat &dst_shape, cv::Mat &dst_visi)
+{
+    int i,n = shape.rows/2; cv::Point p1,p2; cv::Scalar c;
+    int n_rows = tri.rows;
+#pragma omp parallel for
+    for(i = 0; i < n_rows; i++){
+        cv::Point2f pts[3];
+        cv::Point2f dst_pts[3];
+        cv::Point2i pts_i[3];
+        cv::Point2i dst_pts_i[3];
+        cv::Mat tmp_im, tmp_mask;
+
+        if(visi.at<int>(tri.at<int>(i,0),0) == 0 ||
+                visi.at<int>(tri.at<int>(i,1),0) == 0 ||
+                visi.at<int>(tri.at<int>(i,2),0) == 0)continue;
+        if(dst_visi.at<int>(tri.at<int>(i,0),0) == 0 ||
+                dst_visi.at<int>(tri.at<int>(i,1),0) == 0 ||
+                dst_visi.at<int>(tri.at<int>(i,2),0) == 0)continue;
+
+        tmp_im = frame.clone();
+        tmp_mask.create(frame.size(), CV_8UC1);
+        tmp_im = cv::Scalar(0);
+        tmp_mask = cv::Scalar(0);
+        pts[0] = cv::Point(shape.at<double>(tri.at<int>(i,0),0),
+                shape.at<double>(tri.at<int>(i,0)+n,0));
+        pts[1] = cv::Point(shape.at<double>(tri.at<int>(i,1),0),
+                shape.at<double>(tri.at<int>(i,1)+n,0));
+        pts[2] = cv::Point(shape.at<double>(tri.at<int>(i,2),0),
+                shape.at<double>(tri.at<int>(i,2)+n,0));
+        dst_pts[0] = cv::Point(dst_shape.at<double>(tri.at<int>(i,0),0),
+                dst_shape.at<double>(tri.at<int>(i,0)+n,0));
+        dst_pts[1] = cv::Point(dst_shape.at<double>(tri.at<int>(i,1),0),
+                dst_shape.at<double>(tri.at<int>(i,1)+n,0));
+        dst_pts[2] = cv::Point(dst_shape.at<double>(tri.at<int>(i,2),0),
+                dst_shape.at<double>(tri.at<int>(i,2)+n,0));
+
+        cv::Mat affineTransformM = cv::getAffineTransform(pts, dst_pts);
+
+        for(int j=0; j<3; j++){
+            pts_i[j].x = (int)pts[j].x;
+            pts_i[j].y = (int)pts[j].y;
+            dst_pts_i[j].x = (int)dst_pts[j].x;
+            dst_pts_i[j].y = (int)dst_pts[j].y;
+        }
+
+        cv::fillConvexPoly(tmp_mask, pts_i, 3, cv::Scalar(255));
+        frame.copyTo(tmp_im, tmp_mask);
+        cv::warpAffine(tmp_im, tmp_im, affineTransformM, tmp_im.size());
+        tmp_mask = cv::Scalar(0);
+        cv::fillConvexPoly(tmp_mask, dst_pts_i, 3, cv::Scalar(255));
+        // cv::warpAffine(tmp_mask, tmp_mask, affineTransformM, tmp_mask.size());
+        // cv::bitwise_or(face_im, tmp_im, face_im);
+        cv::bitwise_or(mask, tmp_mask, mask);
+        // cv::blur(tmp_mask, tmp_mask,cv::Size(5,5));
+        tmp_im.copyTo(face_im, tmp_mask);
+    }
+
+    return;
+}
+
 //=============================================================================
 int parse_cmd(int argc, const char** argv,
         char* ftFile,char* conFile,char* triFile,
@@ -168,52 +247,102 @@ int main(int argc, const char** argv)
     std::vector<int> wSize1(1); wSize1[0] = 7;
     std::vector<int> wSize2(3); wSize2[0] = 11; wSize2[1] = 9; wSize2[2] = 7;
     int nIter = 5; double clamp=3,fTol=0.01;
-    FACETRACKER::Tracker model(ftFile);
+    // FACETRACKER::Tracker model(ftFile);
+    FACETRACKER::Tracker models[N];
+    for(int i=0; i<N; i++){
+        models[i].Load(ftFile);
+    }
     cv::Mat tri=FACETRACKER::IO::LoadTri(triFile);
     cv::Mat con=FACETRACKER::IO::LoadCon(conFile);
 
     //initialize camera and display window
-    cv::Mat frame,gray,im; double fps=0; char sss[256]; std::string text;
-    CvCapture* camera = cvCreateCameraCapture(CV_CAP_ANY); if(!camera)return -1;
+    // cv::Mat frame,gray,im,tmp_im; double fps=0; char sss[256]; std::string text;
+    cv::Mat frames[N],grays[N],ims[N],masks[N],face_ims[N],masked_ims[N],edge_masks[N];
+    double fps=0; char sss[256]; std::string text;
+    // CvCapture* camera1 = cvCreateCameraCapture(CV_CAP_ANY); if(!camera1)return -1;
+    CvCapture* cameras[N];
+    for(int i=0; i<N; i++){
+        cameras[i] = cvCreateCameraCapture(i); if(!cameras[i]) return -1;
+        cvSetCaptureProperty(cameras[i], CV_CAP_PROP_FRAME_WIDTH, 640);
+        cvSetCaptureProperty(cameras[i], CV_CAP_PROP_FRAME_HEIGHT, 480);
+        std::stringstream ss;
+        // sprintf(sss, "Camera %d", i);
+        // cvNamedWindow(sss,1);
+        sprintf(sss, "Swaped %d", i);
+        cvNamedWindow(sss,1);
+    }
+
     int64 t1,t0 = cvGetTickCount(); int fnum=0;
-    cvNamedWindow("Face Tracker",1);
+
     std::cout << "Hot keys: "        << std::endl
         << "\t ESC - quit"     << std::endl
         << "\t d   - Redetect" << std::endl;
 
     //loop until quit (i.e user presses ESC)
-    bool failed = true;
+    bool failed_flags[N];
+    for(int i=0; i<N; i++){
+        failed_flags[i] = true;
+    }
     while(1){
-        //grab image, resize and flip
-        IplImage* I = cvQueryFrame(camera); if(!I)continue; frame = I;
-        if(scale == 1)im = frame;
-        else cv::resize(frame,im,cv::Size(scale*frame.cols,scale*frame.rows));
-        cv::flip(im,im,1); cv::cvtColor(im,gray,CV_BGR2GRAY);
+        for(int i=0; i<N; i++){
+            //grab image, resize and flip
+            IplImage* I = cvQueryFrame(cameras[i]); if(!I)continue; frames[i] = I;
+            if(scale == 1){
+                ims[i] = frames[i];
+                masks[i].create(ims[i].size(), CV_8UC1);
+            }else{
+                cv::resize(frames[i],ims[i],cv::Size(scale*frames[i].cols,scale*frames[i].rows));
+                masks[i].create(cv::Size(scale*frames[i].cols,scale*frames[i].rows), CV_8UC1);
+            }
+            cv::flip(ims[i],ims[i],1); cv::cvtColor(ims[i],grays[i],CV_BGR2GRAY);
+            masks[i] = cv::Scalar(0);
+            edge_masks[i] = masks[i].clone();
+            face_ims[i] = ims[i].clone();
+            face_ims[i] = cv::Scalar(0);
+            masked_ims[i] = ims[i].clone();
+        }
+#pragma omp parallel for
+        for(int i=0; i<N; i++){
+            //track this image
+            std::vector<int> wSize; if(failed_flags[i])wSize = wSize2; else wSize = wSize1;
+            if(models[i].Track(grays[i],wSize,fpd,nIter,clamp,fTol,fcheck) == 0){
+                int idx = models[i]._clm.GetViewIdx(); failed_flags[i] = false;
+                int dst_idx = models[dst_index(i)]._clm.GetViewIdx();
+                ExtractMask(face_ims[i], masks[i],ims[i], models[i]._shape,con,tri,models[i]._clm._visi[idx], models[dst_index(i)]._shape,models[dst_index(i)]._clm._visi[dst_idx]);
+                // Draw(ims[i],models[i]._shape,con,tri,models[i]._clm._visi[idx]);
+                face_ims[i].copyTo(masked_ims[dst_index(i)], masks[i]);
+            }else{
+                if(show){cv::Mat R(masked_ims[i],cvRect(0,0,150,50)); R = cv::Scalar(0,0,255);}
+                models[i].FrameReset(); failed_flags[i] = true;
+            }
+            //draw framerate on display image
+            if(i==0){
+                if(fnum >= 9){
+                    t1 = cvGetTickCount();
+                    fps = 10.0/((double(t1-t0)/cvGetTickFrequency())/1e+6);
+                    t0 = t1; fnum = 0;
+                }else fnum += 1;
+                if(show){
+                    sprintf(sss,"%d frames/sec",(int)round(fps)); text = sss;
+                    cv::putText(masked_ims[i],text,cv::Point(10,20),
+                            CV_FONT_HERSHEY_SIMPLEX,0.5,CV_RGB(255,255,255));
+                }
+            }
+            //show image and check for user input
+            // sprintf(sss, "Camera %d", i);
+            // imshow(sss,face_ims[i]);
+            sprintf(sss, "Swaped %d", i);
+            imshow(sss,masked_ims[dst_index(i)]);
+        }
 
-        //track this image
-        std::vector<int> wSize; if(failed)wSize = wSize2; else wSize = wSize1;
-        if(model.Track(gray,wSize,fpd,nIter,clamp,fTol,fcheck) == 0){
-            int idx = model._clm.GetViewIdx(); failed = false;
-            Draw(im,model._shape,con,tri,model._clm._visi[idx]);
-        }else{
-            if(show){cv::Mat R(im,cvRect(0,0,150,50)); R = cv::Scalar(0,0,255);}
-            model.FrameReset(); failed = true;
-        }
-        //draw framerate on display image
-        if(fnum >= 9){
-            t1 = cvGetTickCount();
-            fps = 10.0/((double(t1-t0)/cvGetTickFrequency())/1e+6);
-            t0 = t1; fnum = 0;
-        }else fnum += 1;
-        if(show){
-            sprintf(sss,"%d frames/sec",(int)round(fps)); text = sss;
-            cv::putText(im,text,cv::Point(10,20),
-                    CV_FONT_HERSHEY_SIMPLEX,0.5,CV_RGB(255,255,255));
-        }
-        //show image and check for user input
-        imshow("Face Tracker",im);
         int c = cvWaitKey(10);
-        if(c == 27)break; else if(char(c) == 'd')model.FrameReset();
+        if(c == 27){
+            break;
+        }else if(char(c) == 'd'){
+            for(int i=0; i<N; i++){
+                models[i].FrameReset();
+            }
+        }
     }return 0;
 }
 //=============================================================================
